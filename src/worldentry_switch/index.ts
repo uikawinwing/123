@@ -18,15 +18,17 @@ const SWITCH_RULES = [
   { original: '奴隶', dlc: `${DLC_PREFIX}奴隶` },
 ] as const;
 
-type RenamePlan = { next_name: string };
+type Flavor = 'original' | 'dlc';
+type SwitchMatch = { flavor: Flavor; rule_name: string };
 type SwitchResult = {
   target_worldbook: string;
-  renamed_count: number;
+  next_flavor: Flavor;
+  enabled_count: number;
+  disabled_count: number;
   matched_count: number;
 };
 
 let last_switch_click_at = 0;
-let is_switch_running = false;
 
 function pickDefaultWorldbook(): string {
   try {
@@ -59,57 +61,65 @@ function getEntryName(entry: LorebookEntry): string {
   return entry.comment ?? '';
 }
 
-function replaceFirst(value: string, search: string, replacement: string): string {
-  const index = value.indexOf(search);
-  if (index < 0) {
-    return value;
-  }
-  return `${value.slice(0, index)}${replacement}${value.slice(index + search.length)}`;
-}
-
-function planEntryRename(entry: LorebookEntry): RenamePlan | null {
+function matchSwitchEntry(entry: LorebookEntry): SwitchMatch | null {
   const name = getEntryName(entry);
 
   if (name.includes(ELF_DLC_MARKER)) {
-    return { next_name: replaceFirst(name, ELF_DLC_MARKER, '精灵文明') };
+    return { flavor: 'dlc', rule_name: ELF_DLC_MARKER };
   }
   if (name.includes('精灵文明-')) {
-    return {
-      next_name: name.replace(/精灵文明-[^|｜\s，,、；;）)】\]]*/, ELF_DLC_MARKER),
-    };
+    return { flavor: 'original', rule_name: '精灵文明-xxx' };
   }
 
-  for (const rule of SWITCH_RULES) {
-    if (name.includes(rule.dlc)) {
-      return { next_name: replaceFirst(name, rule.dlc, rule.original) };
-    }
-    if (name.includes(rule.original)) {
-      return { next_name: replaceFirst(name, rule.original, rule.dlc) };
-    }
+  const matched_rule = SWITCH_RULES.find(rule => name.includes(rule.dlc) || name.includes(rule.original));
+  if (!matched_rule) {
+    return null;
   }
+  return {
+    flavor: name.includes(matched_rule.dlc) ? 'dlc' : 'original',
+    rule_name: matched_rule.original,
+  };
+}
 
-  return null;
+function inferNextFlavor(entries: LorebookEntry[]): Flavor {
+  const matched_entries = entries
+    .map(entry => ({ entry, match: matchSwitchEntry(entry) }))
+    .filter(item => item.match !== null);
+  const enabled_original_count = matched_entries.filter(
+    item => item.entry.enabled && item.match?.flavor === 'original',
+  ).length;
+  const enabled_dlc_count = matched_entries.filter(item => item.entry.enabled && item.match?.flavor === 'dlc').length;
+
+  return enabled_dlc_count > enabled_original_count ? 'original' : 'dlc';
 }
 
 async function switchWorldbookFlavor(target_worldbook: string): Promise<SwitchResult> {
-  let renamed_count = 0;
+  let next_flavor: Flavor = 'dlc';
+  let enabled_count = 0;
+  let disabled_count = 0;
   let matched_count = 0;
 
-  await updateLorebookEntriesWith(target_worldbook, entries =>
-    entries.map(entry => {
-      const plan = planEntryRename(entry);
-      if (!plan) {
+  await updateLorebookEntriesWith(target_worldbook, entries => {
+    next_flavor = inferNextFlavor(entries);
+    return entries.map(entry => {
+      const match = matchSwitchEntry(entry);
+      if (!match) {
         return entry;
       }
 
       matched_count += 1;
-      if (entry.comment === plan.next_name) {
+      const should_enable = match.flavor === next_flavor;
+      if (entry.enabled === should_enable) {
         return entry;
       }
-      renamed_count += 1;
-      return { ...entry, comment: plan.next_name };
-    }),
-  );
+      if (should_enable) {
+        enabled_count += 1;
+      } else {
+        disabled_count += 1;
+      }
+      return { ...entry, enabled: should_enable };
+    });
+  });
 
   try {
     builtin.reloadEditor(target_worldbook, true);
@@ -117,7 +127,7 @@ async function switchWorldbookFlavor(target_worldbook: string): Promise<SwitchRe
     console.warn(`[${SCRIPT_TITLE}] 世界书编辑器刷新失败:`, error);
   }
 
-  return { target_worldbook, renamed_count, matched_count };
+  return { target_worldbook, next_flavor, enabled_count, disabled_count, matched_count };
 }
 
 async function runSwitcher(): Promise<void> {
@@ -134,7 +144,11 @@ async function runSwitcher(): Promise<void> {
 
     toastr.info(`正在切换世界书：${target_worldbook}`, SCRIPT_TITLE);
     const result = await switchWorldbookFlavor(target_worldbook);
-    toastr.success(`已切换条目名称：改名 ${result.renamed_count} 条，匹配 ${result.matched_count} 条。`, SCRIPT_TITLE);
+    const flavor_text = result.next_flavor === 'dlc' ? 'DLC flavor' : 'original flavor';
+    toastr.success(
+      `已切换为 ${flavor_text}：启用 ${result.enabled_count} 条，禁用 ${result.disabled_count} 条，匹配 ${result.matched_count} 条。`,
+      SCRIPT_TITLE,
+    );
     console.info(`[${SCRIPT_TITLE}] 切换完成`, result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -145,18 +159,41 @@ async function runSwitcher(): Promise<void> {
 
 function handleSwitcherButtonClick(): void {
   const now = Date.now();
-  if (is_switch_running || now - last_switch_click_at < 1000) {
+  if (now - last_switch_click_at < 300) {
     return;
   }
   last_switch_click_at = now;
-  is_switch_running = true;
-  void runSwitcher().finally(() => {
-    is_switch_running = false;
-  });
+  void runSwitcher();
+}
+
+function isSwitcherMirrorButton(target: EventTarget | null): boolean {
+  if (!target || typeof (target as Element).closest !== 'function') {
+    return false;
+  }
+  const button = (target as Element).closest('button.action-item, .qr--button.menu_button.interactable');
+  return button?.textContent?.trim() === SWITCH_BUTTON;
 }
 
 $(() => {
+  const ui_document = (() => {
+    try {
+      return window.parent?.document ?? document;
+    } catch {
+      return document;
+    }
+  })();
+
   replaceScriptButtons([{ name: SWITCH_BUTTON, visible: true }]);
   eventOn(getButtonEvent(SWITCH_BUTTON), handleSwitcherButtonClick);
+  $(ui_document)
+    .off('click.worldEntrySwitcher')
+    .on('click.worldEntrySwitcher', event => {
+      if (!isSwitcherMirrorButton(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      handleSwitcherButtonClick();
+    });
   console.info(`[${SCRIPT_TITLE}] 已加载`);
 });
