@@ -1,36 +1,44 @@
-const SCRIPT_TITLE = '世界书原版/DLC切换器';
-const SWITCH_BUTTON = '切换原版/DLC条目';
+const SCRIPT_TITLE = '世界书原版/DLC互斥切换器';
+const SWITCH_BUTTON = '切换世界书原版/DLC';
 const DLC_PREFIX = '[DLC][扩展]';
-const ELF_ORIGINAL_PATTERN = /精灵文明-[^|｜\s，,、；;）)】\]]*/;
-const ELF_DLC_MARKER = '[DLC][扩展][精灵王国-织阳林冠]';
-const SWITCHER_STATE_KEY = '__world_entry_flavor_switcher_state__';
+const ELF_DLC_ENTRY_NAME = '[DLC][扩展][精灵王国-织阳林冠]';
+const RUNTIME_STATE_KEY = '__rebuilt_worldentry_switch_runtime__';
 
-const SWITCH_RULES = [
-  '世界主设定',
-  '经济价格指南',
-  '种族-精灵',
-  '冒险区域-无尽树海',
-  '势力概览',
+const NORMAL_RULES = [
   '索伦蒂斯王国||翼民圣都梵尼亚||精灵文明||兽族联盟-政治与社会',
+  '冒险区域-无尽树海',
+  '经济价格指南',
+  '世界主设定',
+  '种族-精灵',
+  '势力概览',
   '房产与装修',
   '妓女和娼妇',
   '奴隶',
 ] as const;
 
-type SwitcherState = {
+type Flavor = 'original' | 'dlc';
+
+type RuntimeState = {
   active_token: symbol;
-  last_click_at: number;
-  running: boolean;
+  is_running: boolean;
+  last_started_at: number;
 };
 
-type RenamePlan = { next_name: string };
-type SwitchResult = {
+type EntryMatch = {
+  flavor: Flavor;
+  rule: string;
+};
+
+type SwitchSummary = {
   target_worldbook: string;
-  renamed_count: number;
+  next_flavor: Flavor;
   matched_count: number;
+  enabled_count: number;
+  disabled_count: number;
+  skipped_count: number;
 };
 
-const script_token = Symbol(SCRIPT_TITLE);
+const runtime_token = Symbol(SCRIPT_TITLE);
 
 function getSharedWindow(): Window & Record<string, unknown> {
   try {
@@ -40,24 +48,24 @@ function getSharedWindow(): Window & Record<string, unknown> {
   }
 }
 
-function getSwitcherState(): SwitcherState {
+function getRuntimeState(): RuntimeState {
   const shared_window = getSharedWindow();
-  const old_state = shared_window[SWITCHER_STATE_KEY] as Partial<SwitcherState> | undefined;
-  const state: SwitcherState = {
-    active_token: old_state?.active_token ?? script_token,
-    last_click_at: old_state?.last_click_at ?? 0,
-    running: old_state?.running ?? false,
+  const existing_state = shared_window[RUNTIME_STATE_KEY] as Partial<RuntimeState> | undefined;
+  const state: RuntimeState = {
+    active_token: existing_state?.active_token ?? runtime_token,
+    is_running: existing_state?.is_running ?? false,
+    last_started_at: existing_state?.last_started_at ?? 0,
   };
-  shared_window[SWITCHER_STATE_KEY] = state;
+  shared_window[RUNTIME_STATE_KEY] = state;
   return state;
 }
 
-function markCurrentScriptActive(): void {
-  getSwitcherState().active_token = script_token;
+function activateThisRuntime(): void {
+  getRuntimeState().active_token = runtime_token;
 }
 
-function isCurrentScriptActive(): boolean {
-  return getSwitcherState().active_token === script_token;
+function isThisRuntimeActive(): boolean {
+  return getRuntimeState().active_token === runtime_token;
 }
 
 function pickDefaultWorldbook(): string {
@@ -87,56 +95,87 @@ function pickDefaultWorldbook(): string {
   }
 }
 
-function replaceFirst(value: string, search: string, replacement: string): string {
-  const index = value.indexOf(search);
-  if (index < 0) {
-    return value;
-  }
-  return `${value.slice(0, index)}${replacement}${value.slice(index + search.length)}`;
+function getEntryTitle(entry: WorldbookEntry): string {
+  return entry.name ?? '';
 }
 
-function planEntryRename(entry: WorldbookEntry): RenamePlan | null {
-  const name = entry.name ?? '';
+function matchEntry(entry: WorldbookEntry): EntryMatch | null {
+  const title = getEntryTitle(entry);
 
-  if (name.includes(ELF_DLC_MARKER)) {
-    return { next_name: replaceFirst(name, ELF_DLC_MARKER, '精灵文明') };
+  if (title.includes(ELF_DLC_ENTRY_NAME)) {
+    return { flavor: 'dlc', rule: ELF_DLC_ENTRY_NAME };
   }
-  if (ELF_ORIGINAL_PATTERN.test(name)) {
-    return { next_name: name.replace(ELF_ORIGINAL_PATTERN, ELF_DLC_MARKER) };
+  if (!title.includes(DLC_PREFIX) && title.includes('精灵文明-')) {
+    return { flavor: 'original', rule: '精灵文明-xxx' };
   }
 
-  for (const original_name of SWITCH_RULES) {
+  for (const original_name of NORMAL_RULES) {
     const dlc_name = `${DLC_PREFIX}${original_name}`;
-    if (name.includes(dlc_name)) {
-      return { next_name: replaceFirst(name, dlc_name, original_name) };
+    if (title.includes(dlc_name)) {
+      return { flavor: 'dlc', rule: original_name };
     }
-    if (name.includes(original_name)) {
-      return { next_name: replaceFirst(name, original_name, dlc_name) };
+    if (!title.includes(DLC_PREFIX) && title.includes(original_name)) {
+      return { flavor: 'original', rule: original_name };
     }
   }
 
   return null;
 }
 
-async function switchWorldbookFlavor(target_worldbook: string): Promise<SwitchResult> {
-  let renamed_count = 0;
+function decideNextFlavor(entries: WorldbookEntry[]): Flavor {
+  let enabled_original_count = 0;
+  let enabled_dlc_count = 0;
+
+  for (const entry of entries) {
+    if (!entry.enabled) {
+      continue;
+    }
+
+    const match = matchEntry(entry);
+    if (!match) {
+      continue;
+    }
+
+    if (match.flavor === 'dlc') {
+      enabled_dlc_count += 1;
+    } else {
+      enabled_original_count += 1;
+    }
+  }
+
+  return enabled_dlc_count > enabled_original_count ? 'original' : 'dlc';
+}
+
+async function switchWorldbookFlavor(target_worldbook: string): Promise<SwitchSummary> {
+  const worldbook = await getWorldbook(target_worldbook);
+  const next_flavor = decideNextFlavor(worldbook);
   let matched_count = 0;
+  let enabled_count = 0;
+  let disabled_count = 0;
+  let skipped_count = 0;
 
-  await updateWorldbookWith(target_worldbook, entries =>
-    entries.map(entry => {
-      const plan = planEntryRename(entry);
-      if (!plan) {
-        return entry;
-      }
+  const next_worldbook = worldbook.map(entry => {
+    const match = matchEntry(entry);
+    if (!match) {
+      skipped_count += 1;
+      return entry;
+    }
 
-      matched_count += 1;
-      if (entry.name === plan.next_name) {
-        return entry;
-      }
-      renamed_count += 1;
-      return { ...entry, name: plan.next_name };
-    }),
-  );
+    matched_count += 1;
+    const next_enabled = match.flavor === next_flavor;
+    if (entry.enabled === next_enabled) {
+      return entry;
+    }
+
+    if (next_enabled) {
+      enabled_count += 1;
+    } else {
+      disabled_count += 1;
+    }
+    return { ...entry, enabled: next_enabled };
+  });
+
+  await replaceWorldbook(target_worldbook, next_worldbook, { render: 'immediate' });
 
   try {
     builtin.reloadEditor(target_worldbook, true);
@@ -144,49 +183,62 @@ async function switchWorldbookFlavor(target_worldbook: string): Promise<SwitchRe
     console.warn(`[${SCRIPT_TITLE}] 世界书编辑器刷新失败:`, error);
   }
 
-  return { target_worldbook, renamed_count, matched_count };
+  return { target_worldbook, next_flavor, matched_count, enabled_count, disabled_count, skipped_count };
 }
 
-async function runSwitcher(): Promise<void> {
-  try {
-    const target_worldbook = pickDefaultWorldbook();
-    if (!target_worldbook) {
-      toastr.error('找不到可切换的默认世界书。', SCRIPT_TITLE);
-      return;
-    }
-    if (!getWorldbookNames().includes(target_worldbook)) {
-      toastr.error(`找不到世界书：${target_worldbook}`, SCRIPT_TITLE);
-      return;
-    }
-
-    toastr.info(`正在切换世界书：${target_worldbook}`, SCRIPT_TITLE);
-    const result = await switchWorldbookFlavor(target_worldbook);
-    toastr.success(`已切换条目名称：改名 ${result.renamed_count} 条，匹配 ${result.matched_count} 条。`, SCRIPT_TITLE);
-    console.info(`[${SCRIPT_TITLE}] 切换完成`, result);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[${SCRIPT_TITLE}] 切换失败:`, error);
-    toastr.error(message, SCRIPT_TITLE);
+async function runSwitchOnce(): Promise<void> {
+  const target_worldbook = pickDefaultWorldbook();
+  if (!target_worldbook) {
+    toastr.error('找不到当前角色、聊天或全局绑定的世界书。', SCRIPT_TITLE);
+    return;
   }
-}
-
-function handleSwitcherButtonClick(): void {
-  const state = getSwitcherState();
-  const now = Date.now();
-  if (!isCurrentScriptActive() || state.running || now - state.last_click_at < 1000) {
+  if (!getWorldbookNames().includes(target_worldbook)) {
+    toastr.error(`找不到世界书：${target_worldbook}`, SCRIPT_TITLE);
     return;
   }
 
-  state.last_click_at = now;
-  state.running = true;
-  void runSwitcher().finally(() => {
-    state.running = false;
-  });
+  toastr.info(`正在切换：${target_worldbook}`, SCRIPT_TITLE);
+  const summary = await switchWorldbookFlavor(target_worldbook);
+  const flavor_label = summary.next_flavor === 'dlc' ? 'DLC flavor' : 'original flavor';
+  console.info(`[${SCRIPT_TITLE}] 切换完成`, summary);
+  toastr.success(
+    `已切换为 ${flavor_label}：启用 ${summary.enabled_count} 条，禁用 ${summary.disabled_count} 条，匹配 ${summary.matched_count} 条。`,
+    SCRIPT_TITLE,
+  );
+}
+
+function handleSwitchButtonClick(): void {
+  const state = getRuntimeState();
+  const now = Date.now();
+
+  if (!isThisRuntimeActive()) {
+    return;
+  }
+  if (state.is_running || now - state.last_started_at < 1500) {
+    console.warn(`[${SCRIPT_TITLE}] 忽略重复触发`, {
+      is_running: state.is_running,
+      last_started_at: state.last_started_at,
+      now,
+    });
+    return;
+  }
+
+  state.is_running = true;
+  state.last_started_at = now;
+  void runSwitchOnce()
+    .catch(error => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[${SCRIPT_TITLE}] 切换失败:`, error);
+      toastr.error(message, SCRIPT_TITLE);
+    })
+    .finally(() => {
+      state.is_running = false;
+    });
 }
 
 $(() => {
-  markCurrentScriptActive();
+  activateThisRuntime();
   replaceScriptButtons([{ name: SWITCH_BUTTON, visible: true }]);
-  eventOn(getButtonEvent(SWITCH_BUTTON), handleSwitcherButtonClick);
+  eventOn(getButtonEvent(SWITCH_BUTTON), handleSwitchButtonClick);
   console.info(`[${SCRIPT_TITLE}] 已加载`);
 });
